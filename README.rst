@@ -24,5 +24,5 @@ If you want to test:
 
 .. code-block:: bash
 
-    $ pip install '.[dev]'
+    $ pip install --index-url 'https://:2024-02-10T13:32:02.969646Z@time-machines-pypi.sealsecurity.io/' '.[dev]'
     $ inv test

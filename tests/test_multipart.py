@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 import sys
@@ -1021,6 +1022,18 @@ class TestFormParser(unittest.TestCase):
         with self.assertRaises(MultipartParseError):
             i = self.f.write(data)
 
+    def test_multipart_header_count_limit(self):
+        self.make("poc")
+        payload = b'--poc\r\nContent-Disposition: form-data; name="x"\r\n' + (b"X-A: 1\r\n" * 8)
+        with self.assertRaisesRegex(MultipartParseError, "Maximum header count exceeded"):
+            self.f.write(payload)
+
+    def test_multipart_header_size_limit(self):
+        self.make("poc")
+        payload = b'--poc\r\nContent-Disposition: form-data; name="x"\r\n' + b"X-A: " + (b"a" * (4096 + 124))
+        with self.assertRaisesRegex(MultipartParseError, "Maximum header size exceeded"):
+            self.f.write(payload)
+
     def test_octet_stream(self):
         files = []
 
@@ -1138,6 +1151,48 @@ class TestFormParser(unittest.TestCase):
         f.write(data)
         f.finalize()
         self.assert_file_data(files[0], b"Test")
+
+    def test_multipart_parser_data_end_with_crlf_without_warnings(self):
+        """This test makes sure that the parser does not emit warnings when the data ends with a CRLF."""
+        data = (
+            b"--boundary\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="filename.txt"\r\n'
+            b"Content-Type: text/plain\r\n\r\n"
+            b"hello\r\n"
+            b"--boundary--\r\n"
+        )
+
+        files = []
+
+        def on_file(f):
+            files.append(f)
+
+        on_field = Mock()
+        on_end = Mock()
+        f = FormParser("multipart/form-data", on_field, on_file, on_end=on_end, boundary="boundary")
+
+        # Create a custom log handler to capture warnings
+        log_handler = logging.handlers.MemoryHandler(capacity=1000)
+        logger = logging.getLogger("multipart.multipart")
+        logger.addHandler(log_handler)
+        old_level = logger.level
+        logger.setLevel(logging.WARNING)
+
+        try:
+            f.write(data)
+            f.finalize()
+
+            # Check that no WARNING logs were emitted
+            warning_records = [r for r in log_handler.buffer if r.levelno >= logging.WARNING]
+            self.assertEqual(len(warning_records), 0,
+                           f"Expected no warnings, but got {len(warning_records)}: {[r.getMessage() for r in warning_records]}")
+        finally:
+            logger.removeHandler(log_handler)
+            logger.setLevel(old_level)
+
+        # Verify the file was parsed correctly
+        self.assertEqual(len(files), 1)
+        self.assert_file_data(files[0], b"hello\r\n")
 
     def test_handles_None_fields(self):
         fields = []

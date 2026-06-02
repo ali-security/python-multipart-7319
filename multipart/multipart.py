@@ -47,6 +47,8 @@ if TYPE_CHECKING:  # pragma: no cover
         UPLOAD_ERROR_ON_BAD_CTE: bool
         MAX_MEMORY_FILE_SIZE: int
         MAX_BODY_SIZE: float
+        MAX_HEADER_COUNT: int
+        MAX_HEADER_SIZE: int
 
     class FileConfig(TypedDict, total=False):
         UPLOAD_DIR: str | None
@@ -126,6 +128,13 @@ def ord_char(c):
 
 def join_bytes(b):
     return bytes(list(b))
+
+
+DEFAULT_MAX_HEADER_COUNT = 8
+"""Default maximum number of headers allowed per multipart part."""
+
+DEFAULT_MAX_HEADER_SIZE = 4096 + 128
+"""Default maximum size of a single multipart header line, including syntax overhead."""
 
 
 def parse_options_header(value: str | bytes) -> tuple[bytes, dict[bytes, bytes]]:
@@ -367,7 +376,9 @@ class File:
 
         # Split the extension from the filename.
         if file_name is not None:
-            base, ext = os.path.splitext(file_name)
+            # Extract just the basename to avoid directory traversal
+            basename = os.path.basename(file_name)
+            base, ext = os.path.splitext(basename)
             self._file_base = base
             self._ext = ext
 
@@ -1031,9 +1042,22 @@ class MultipartParser(BaseParser):
 
     :param max_size: The maximum size of body to parse.  Defaults to infinity -
                      i.e. unbounded.
+
+    :param max_header_count: The maximum number of headers allowed per part.
+
+    :param max_header_size: The maximum size of a single header line (excluding
+                            the trailing CRLF).
     """
 
-    def __init__(self, boundary: bytes | str, callbacks: MultipartCallbacks = {}, max_size=float("inf")):
+    def __init__(
+        self,
+        boundary: bytes | str,
+        callbacks: MultipartCallbacks = {},
+        max_size=float("inf"),
+        *,
+        max_header_count: int = DEFAULT_MAX_HEADER_COUNT,
+        max_header_size: int = DEFAULT_MAX_HEADER_SIZE,
+    ):
         # Initialize parser state.
         super().__init__()
         self.state = MultipartState.START
@@ -1045,6 +1069,12 @@ class MultipartParser(BaseParser):
             raise ValueError("max_size must be a positive number, not %r" % max_size)
         self.max_size = max_size
         self._current_size = 0
+
+        self.max_header_count = max_header_count
+        self._current_header_count = 0
+
+        self.max_header_size = max_header_size
+        self._current_header_size = 0
 
         # Setup marks.  These are used to track the state of data received.
         self.marks = {}
@@ -1113,9 +1143,17 @@ class MultipartParser(BaseParser):
         state = self.state
         index = self.index
         flags = self.flags
+        current_header_count = self._current_header_count
+        current_header_size = self._current_header_size
 
         # Our index defaults to 0.
         i = 0
+
+        def advance_header_size(amount: int = 1) -> None:
+            nonlocal current_header_size
+            current_header_size += amount
+            if current_header_size > self.max_header_size:
+                raise MultipartParseError("Maximum header size exceeded", offset=i)
 
         # Set a mark.
         def set_mark(name):
@@ -1193,6 +1231,8 @@ class MultipartParser(BaseParser):
 
                     # Callback for the start of a part.
                     self.callback("part_begin")
+                    current_header_count = 0
+                    current_header_size = 0
 
                     # Move to the next character and state.
                     state = MultipartState.HEADER_FIELD_START
@@ -1213,6 +1253,12 @@ class MultipartParser(BaseParser):
                 # Mark the start of a header field here, reset the index, and
                 # continue parsing our header field.
                 index = 0
+
+                if c != CR:
+                    current_header_count += 1
+                    if current_header_count > self.max_header_count:
+                        raise MultipartParseError("Maximum header count exceeded", offset=i)
+                    current_header_size = 0
 
                 # Set a mark of our header field.
                 set_mark("header_field")
@@ -1240,6 +1286,7 @@ class MultipartParser(BaseParser):
 
                 # If we've reached a colon, we're done with this header.
                 elif c == COLON:
+                    advance_header_size()
                     # A 0-length header is an error.
                     if index == 1:
                         msg = "Found 0-length header at %d" % (i,)
@@ -1264,10 +1311,13 @@ class MultipartParser(BaseParser):
                         e = MultipartParseError(msg)
                         e.offset = i
                         raise e
+                    else:
+                        advance_header_size()
 
             elif state == MultipartState.HEADER_VALUE_START:
                 # Skip leading spaces.
                 if c == SPACE:
+                    advance_header_size()
                     i += 1
                     continue
 
@@ -1284,7 +1334,10 @@ class MultipartParser(BaseParser):
                 if c == CR:
                     data_callback("header_value")
                     self.callback("header_end")
+                    current_header_size = 0
                     state = MultipartState.HEADER_VALUE_ALMOST_DONE
+                else:
+                    advance_header_size()
 
             elif state == MultipartState.HEADER_VALUE_ALMOST_DONE:
                 # The last character should be a LF.  If not, it's an error.
@@ -1406,6 +1459,8 @@ class MultipartParser(BaseParser):
                             # a part, and are starting a new one.
                             self.callback("part_end")
                             self.callback("part_begin")
+                            current_header_count = 0
+                            current_header_size = 0
 
                             # Move to parsing new headers.
                             index = 0
@@ -1457,6 +1512,9 @@ class MultipartParser(BaseParser):
                     i -= 1
 
             elif state == MultipartState.END:
+                # Don't do anything if chunk ends with CRLF.
+                if c == CR and i + 1 < length and data[i + 1] == LF:
+                    i += 2
                 # Do nothing and just consume a byte in the end state.
                 if c not in (CR, LF):
                     self.logger.warning("Consuming a byte '0x%x' in the end state", c)
@@ -1488,6 +1546,8 @@ class MultipartParser(BaseParser):
         self.state = state
         self.index = index
         self.flags = flags
+        self._current_header_count = current_header_count
+        self._current_header_size = current_header_size
 
         # Return our data length to indicate no errors, and that we processed
         # all of it.
@@ -1565,6 +1625,8 @@ class FormParser:
     #: Note: all file sizes should be in bytes.
     DEFAULT_CONFIG: FormParserConfig = {
         "MAX_BODY_SIZE": float("inf"),
+        "MAX_HEADER_COUNT": DEFAULT_MAX_HEADER_COUNT,
+        "MAX_HEADER_SIZE": DEFAULT_MAX_HEADER_SIZE,
         "MAX_MEMORY_FILE_SIZE": 1 * 1024 * 1024,
         "UPLOAD_DIR": None,
         "UPLOAD_KEEP_FILENAME": False,
@@ -1786,6 +1848,8 @@ class FormParser:
                     "on_end": on_end,
                 },
                 max_size=self.config["MAX_BODY_SIZE"],
+                max_header_count=self.config["MAX_HEADER_COUNT"],
+                max_header_size=self.config["MAX_HEADER_SIZE"],
             )
 
         else:
